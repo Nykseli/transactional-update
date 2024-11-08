@@ -44,6 +44,8 @@ public:
     void addSupplements();
     void snapMount();
     int runCommand(char* argv[], bool inChroot, std::string* buffer);
+    int runInTransaction(std::function<int()> callback, bool inChroot, std::string* buffer);
+    int runInThread(std::function<int()> callback, bool inChroot, std::string* buffer);
     static int inotifyAdd(const char *pathname, const struct stat *sbuf, int type, struct FTW *ftwb);
     int inotifyRead();
     std::unique_ptr<SnapshotManager> snapshotMgr;
@@ -350,7 +352,7 @@ int Transaction::impl::inotifyRead() {
     return ret;
 }
 
-int Transaction::impl::runCommand(char* argv[], bool inChroot, std::string* output) {
+int Transaction::impl::runInThread(std::function<int()> callback, bool inChroot, std::string* output) {
     if (discardIfNoChange) {
         inotifyFd = inotify_init();
         if (inotifyFd == -1)
@@ -361,16 +363,52 @@ int Transaction::impl::runCommand(char* argv[], bool inChroot, std::string* outp
         nftw(snapshot->getRoot().c_str(), inotifyAdd, 20, FTW_MOUNT | FTW_PHYS);
     }
 
-    std::string opts = "Executing `";
-    int i = 0;
-    while (argv[i]) {
-        if (i > 0)
-            opts.append(" ");
-        opts.append(argv[i]);
-        i++;
+    if (inChroot) {
+        auto currentPathRel = std::filesystem::current_path().relative_path();
+        if (!std::filesystem::exists(bindDir / currentPathRel) || chdir((bindDir / currentPathRel).c_str()) < 0) {
+            if (chdir(bindDir.c_str()) < 0) {
+                tulog.info("Warning: Couldn't set working directory: ", std::string(strerror(errno)));
+            }
+        }
+        if (chroot(bindDir.c_str()) < 0) {
+            tulog.error("Chrooting to " + bindDir.native() + " failed: " + std::string(strerror(errno)));
+            _exit(errno);
+        }
+        // Prevent mounts from within the chroot environment influence the tukit organized mounts
+        if (unshare(CLONE_NEWNS) < 0) {
+            tulog.error("Creating new mount namespace failed: " + std::string(strerror(errno)));
+            _exit(errno);
+        }
+        if (mount("none", "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0) {
+            tulog.error("Setting private mount for command execution failed: " + std::string(strerror(errno)));
+            _exit(errno);
+        }
     }
-    opts.append("`:");
-    tulog.info(opts);
+
+    // Set indicator for RPM pre/post sections to detect whether we run in a
+    // transactional update
+    if (setenv("TRANSACTIONAL_UPDATE", "true", 1) < 0) {
+        tulog.error("Setting environment variable TRANSACTIONAL_UPDATE failed: " + std::string(strerror(errno)));
+        _exit(errno);
+    }
+    if (setenv("TRANSACTIONAL_UPDATE_ROOT", snapshot->getRoot().c_str(), 1)) {
+        tulog.error("Setting environment variable TRANSACTIONAL_UPDATE_ROOT failed: " + std::string(strerror(errno)));
+        _exit(errno);
+    }
+
+    return callback();
+}
+
+int Transaction::impl::runInTransaction(std::function<int()> callback, bool inChroot, std::string* output) {
+    if (discardIfNoChange) {
+        inotifyFd = inotify_init();
+        if (inotifyFd == -1)
+            throw std::runtime_error{"Couldn't initialize inotify."};
+
+        // Recursively register all directories of the root file system
+        inotifyExcludes = MountList::getList(snapshot->getRoot());
+        nftw(snapshot->getRoot().c_str(), inotifyAdd, 20, FTW_MOUNT | FTW_PHYS);
+    }
 
     int status = 1;
     int ret;
@@ -436,10 +474,8 @@ int Transaction::impl::runCommand(char* argv[], bool inChroot, std::string* outp
             _exit(errno);
         }
 
-        if (execvp(argv[0], (char* const*)argv) < 0) {
-            tulog.error("Calling " + std::string(argv[0]) + " failed: " + std::string(strerror(errno)));
-            _exit(errno);
-        }
+        _exit(callback());
+
         ret = -1;
     } else {
         ret = close(pipefd[1]);
@@ -473,6 +509,27 @@ int Transaction::impl::runCommand(char* argv[], bool inChroot, std::string* outp
     return ret;
 }
 
+int Transaction::impl::runCommand(char* argv[], bool inChroot, std::string* output) {
+    std::string opts = "Executing `";
+    int i = 0;
+    while (argv[i]) {
+        if (i > 0)
+            opts.append(" ");
+        opts.append(argv[i]);
+        i++;
+    }
+    opts.append("`:");
+    tulog.info(opts);
+
+    return this->runInTransaction([argv]() {
+        if (execvp(argv[0], (char* const*)argv) < 0) {
+            tulog.error("Calling " + std::string(argv[0]) + " failed: " + std::string(strerror(errno)));
+            _exit(errno);
+        }
+        return 0;
+     }, inChroot, output);
+}
+
 int Transaction::execute(char* argv[], std::string* output) {
     TransactionalUpdate::Plugins plugins{this};
     plugins.run("execute-pre", argv);
@@ -497,6 +554,13 @@ int Transaction::callExt(char* argv[], std::string* output) {
     plugins.run("callExt-pre", argv);
     int status = this->pImpl->runCommand(argv, false, output);
     plugins.run("callExt-post", argv);
+    return status;
+}
+
+int Transaction::callFn(std::function<int()> callback, std::string *output) {
+    tulog.debug("Calling callback funciton!!!");
+    // int status = this->pImpl->runInTransaction(callback, true, output);
+    int status = this->pImpl->runInThread(callback, true, output);
     return status;
 }
 

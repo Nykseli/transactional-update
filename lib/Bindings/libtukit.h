@@ -32,6 +32,7 @@ int tukit_tx_discard_if_unchanged(tukit_tx tx, int discard);
 int tukit_tx_resume(tukit_tx tx, char* id);
 int tukit_tx_execute(tukit_tx tx, char* argv[], const char* output[]);
 int tukit_tx_call_ext(tukit_tx tx, char* argv[], const char* output[]);
+int tukit_tx_call_fn(tukit_tx tx, int (*callback)(void*), void* ctx, const char* output[]);
 int tukit_tx_finalize(tukit_tx tx);
 int tukit_tx_keep(tukit_tx tx);
 int tukit_tx_send_signal(tukit_tx tx, int signal);

@@ -13,6 +13,22 @@
 #include <string.h>
 #include <vector>
 
+// TODO: clean includes
+#define STACK_SIZE (1024 * 1024 * 8) /* Stack size for cloned child */
+#include <err.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <linux/limits.h>
+
 using namespace TransactionalUpdate;
 thread_local std::string errmsg;
 
@@ -118,6 +134,67 @@ int tukit_tx_call_ext(tukit_tx tx, char* argv[], const char* output[]) {
         errmsg = e.what();
         return -1;
     }
+}
+static int tukit_tx_call_fn_inner(tukit_tx tx, int (*callback)(void*), void* ctx) {
+    Transaction* transaction = reinterpret_cast<Transaction*>(tx);
+    std::string buffer;
+    auto cbfn = [&]() {
+        int res = callback(ctx);
+        return res;
+    };
+
+    try {
+        int ret = transaction->callFn(cbfn, &buffer);
+        return ret;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "ERROR: %s\n", e.what());
+        errmsg = e.what();
+        return -1;
+    }
+}
+struct tuki_thread_data {
+    tukit_tx tx;
+    int (*callback)(void*);
+    void* ctx;
+};
+static int child_func(void *arg)
+{
+    tuki_thread_data* fb = (tuki_thread_data*)arg;
+    tukit_tx_call_fn_inner(fb->tx, fb->callback, fb->ctx);
+    _exit(0);
+    return 0;
+}
+int tukit_tx_call_fn(tukit_tx tx, int (*callback)(void*), void* ctx, const char* __output[]) {
+    char* stack = (char*)malloc(STACK_SIZE);
+    if (!stack) {
+      perror("malloc");
+      exit(1);
+    }
+
+    tuki_thread_data fb = {
+        .tx = tx,
+        .callback = callback,
+        .ctx = ctx,
+    };
+
+    tukit_set_loglevel(Debug);
+    tukit_tx_init(tx, (char*)"");
+
+    pid_t pid = clone(child_func, stack + STACK_SIZE, CLONE_VM | CLONE_IO | SIGCHLD, &fb);
+    if (pid == -1) {
+      perror("clone");
+      exit(1);
+    }
+
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+      perror("wait");
+      exit(1);
+    }
+
+    tukit_tx_finalize(tx);
+
+    return 0;
 }
 int tukit_tx_finalize(tukit_tx tx) {
     Transaction* transaction = reinterpret_cast<Transaction*>(tx);

@@ -14,6 +14,7 @@
 #define T_U_TRANSACTION_H
 
 #include <filesystem>
+#include <functional>
 #include <optional>
 
 namespace TransactionalUpdate {
@@ -110,6 +111,8 @@ public:
                  int status = transaction.callExt(args);
      */
     int callExt(char* argv[], std::string *output=nullptr);
+
+    int callFn(std::function<int()> callback, std::string *output=nullptr);
 
     /**
      * @brief Close a transaction and set it as the new default snapshot
